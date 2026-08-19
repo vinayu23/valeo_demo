@@ -1,0 +1,80 @@
+name: CI/CD Pipeline - .NET API to GKE via Argo CD
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: us-central1
+  GAR_REPOSITORY: sample-dotnet-repo
+  IMAGE_NAME: sample-dotnet-api
+
+jobs:
+  build-and-push:
+    name: Build, Push Image & Update GitOps Manifest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Define Image Tags
+        id: vars
+        run: |
+          REGISTRY="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}"
+          FULL_IMAGE="${REGISTRY}/${{ env.IMAGE_NAME }}"
+          TAG="${{ github.sha }}"
+          echo "FULL_IMAGE=${FULL_IMAGE}" >> $GITHUB_ENV
+          echo "TAG=${TAG}" >> $GITHUB_ENV
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t ${{ env.FULL_IMAGE }}:${{ env.TAG }} \
+            -t ${{ env.FULL_IMAGE }}:latest \
+            .
+
+      - name: Push Docker Image to Google Artifact Registry
+        run: |
+          docker push ${{ env.FULL_IMAGE }}:${{ env.TAG }}
+          docker push ${{ env.FULL_IMAGE }}:latest
+
+      - name: Set up Kustomize
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Update Kubernetes Manifest (Image Tag)
+        run: |
+          cd k8s
+          kustomize edit set image sample-dotnet-api-image=${{ env.FULL_IMAGE }}:${{ env.TAG }}
+
+      - name: Commit and Push Updated Manifest
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/kustomization.yaml
+          git status
+          if git diff --staged --quiet; then
+            echo "No changes in kustomization.yaml to commit"
+          else
+            git commit -m "ci: update image tag to ${{ env.TAG }} [skip ci]"
+            git push
+          fi
